@@ -10,12 +10,17 @@
 (define-constant err-expired (err u108))
 (define-constant err-already-used (err u109))
 (define-constant err-transfer-blocked (err u110))
+(define-constant err-pool-not-found (err u111))
+(define-constant err-pool-inactive (err u112))
+(define-constant err-insufficient-pool-funds (err u113))
+(define-constant err-min-amount-not-met (err u114))
 
 (define-data-var last-token-id uint u0)
 (define-data-var total-scholarships uint u0)
 (define-data-var active-scholarships uint u0)
 (define-data-var used-scholarships uint u0)
 (define-data-var expired-scholarships uint u0)
+(define-data-var last-pool-id uint u0)
 
 (define-map scholarship-details
     uint
@@ -54,6 +59,36 @@
         used-by: principal,
         transaction-id: (string-ascii 100),
     }
+)
+
+(define-map scholarship-pools
+    uint
+    {
+        creator: principal,
+        title: (string-ascii 100),
+        description: (string-ascii 200),
+        target-amount: uint,
+        current-amount: uint,
+        min-scholarship-amount: uint,
+        institution: (string-ascii 100),
+        field-of-study: (string-ascii 100),
+        is-active: bool,
+        created-at: uint,
+        deadline: uint,
+    }
+)
+
+(define-map pool-contributions
+    {
+        pool-id: uint,
+        contributor: principal,
+    }
+    uint
+)
+
+(define-map pool-contributors
+    uint
+    (list 100 principal)
 )
 
 (define-read-only (get-last-token-id)
@@ -102,6 +137,30 @@
 
 (define-read-only (get-scholarship-usage (token-id uint))
     (map-get? scholarship-usage token-id)
+)
+
+(define-read-only (get-pool-details (pool-id uint))
+    (map-get? scholarship-pools pool-id)
+)
+
+(define-read-only (get-pool-contributors (pool-id uint))
+    (default-to (list) (map-get? pool-contributors pool-id))
+)
+
+(define-read-only (get-user-contribution
+        (pool-id uint)
+        (contributor principal)
+    )
+    (default-to u0
+        (map-get? pool-contributions {
+            pool-id: pool-id,
+            contributor: contributor,
+        })
+    )
+)
+
+(define-read-only (get-last-pool-id)
+    (var-get last-pool-id)
 )
 
 (define-read-only (is-scholarship-valid (token-id uint))
@@ -158,6 +217,134 @@
     (begin
         (asserts! (is-eq tx-sender contract-owner) err-owner-only)
         (ok (map-delete authorized-issuers issuer))
+    )
+)
+
+(define-public (create-scholarship-pool
+        (title (string-ascii 100))
+        (description (string-ascii 200))
+        (target-amount uint)
+        (min-scholarship-amount uint)
+        (institution (string-ascii 100))
+        (field-of-study (string-ascii 100))
+        (deadline-blocks uint)
+    )
+    (let (
+            (pool-id (+ (var-get last-pool-id) u1))
+            (current-block burn-block-height)
+            (deadline (+ current-block deadline-blocks))
+        )
+        (asserts! (> target-amount u0) err-invalid-amount)
+        (asserts! (> min-scholarship-amount u0) err-invalid-amount)
+        (asserts! (> deadline-blocks u0) err-invalid-amount)
+        (asserts! (<= min-scholarship-amount target-amount) err-invalid-amount)
+
+        (map-set scholarship-pools pool-id {
+            creator: tx-sender,
+            title: title,
+            description: description,
+            target-amount: target-amount,
+            current-amount: u0,
+            min-scholarship-amount: min-scholarship-amount,
+            institution: institution,
+            field-of-study: field-of-study,
+            is-active: true,
+            created-at: current-block,
+            deadline: deadline,
+        })
+
+        (var-set last-pool-id pool-id)
+        (ok pool-id)
+    )
+)
+
+(define-public (contribute-to-pool
+        (pool-id uint)
+        (amount uint)
+    )
+    (let (
+            (pool-info (unwrap! (map-get? scholarship-pools pool-id) err-pool-not-found))
+            (current-block burn-block-height)
+            (current-contribution (get-user-contribution pool-id tx-sender))
+            (new-contribution (+ current-contribution amount))
+            (new-pool-amount (+ (get current-amount pool-info) amount))
+            (contributors (get-pool-contributors pool-id))
+        )
+        (asserts! (get is-active pool-info) err-pool-inactive)
+        (asserts! (< current-block (get deadline pool-info)) err-expired)
+        (asserts! (> amount u0) err-invalid-amount)
+
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+
+        (map-set pool-contributions {
+            pool-id: pool-id,
+            contributor: tx-sender,
+        }
+            new-contribution
+        )
+
+        (map-set scholarship-pools pool-id
+            (merge pool-info { current-amount: new-pool-amount })
+        )
+
+        (if (is-none (index-of contributors tx-sender))
+            (map-set pool-contributors pool-id
+                (unwrap-panic (as-max-len? (append contributors tx-sender) u100))
+            )
+            true
+        )
+
+        (ok true)
+    )
+)
+
+(define-public (issue-scholarship-from-pool
+        (pool-id uint)
+        (recipient principal)
+        (scholarship-amount uint)
+        (expiry-blocks uint)
+        (scholarship-id (string-ascii 50))
+    )
+    (let (
+            (pool-info (unwrap! (map-get? scholarship-pools pool-id) err-pool-not-found))
+            (pool-creator (get creator pool-info))
+            (current-pool-amount (get current-amount pool-info))
+            (min-amount (get min-scholarship-amount pool-info))
+            (new-pool-amount (- current-pool-amount scholarship-amount))
+        )
+        (asserts! (is-eq tx-sender pool-creator) err-unauthorized)
+        (asserts! (get is-active pool-info) err-pool-inactive)
+        (asserts! (>= scholarship-amount min-amount) err-min-amount-not-met)
+        (asserts! (>= current-pool-amount scholarship-amount)
+            err-insufficient-pool-funds
+        )
+
+        (try! (as-contract (stx-transfer? scholarship-amount tx-sender recipient)))
+
+        (map-set scholarship-pools pool-id
+            (merge pool-info { current-amount: new-pool-amount })
+        )
+
+        (try! (issue-scholarship recipient (get institution pool-info)
+            scholarship-amount (get field-of-study pool-info) expiry-blocks
+            scholarship-id
+        ))
+
+        (ok true)
+    )
+)
+
+(define-public (close-pool (pool-id uint))
+    (let (
+            (pool-info (unwrap! (map-get? scholarship-pools pool-id) err-pool-not-found))
+            (pool-creator (get creator pool-info))
+        )
+        (asserts! (is-eq tx-sender pool-creator) err-unauthorized)
+        (asserts! (get is-active pool-info) err-pool-inactive)
+
+        (map-set scholarship-pools pool-id (merge pool-info { is-active: false }))
+
+        (ok true)
     )
 )
 
