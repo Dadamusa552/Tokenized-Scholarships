@@ -14,6 +14,11 @@
 (define-constant err-pool-inactive (err u112))
 (define-constant err-insufficient-pool-funds (err u113))
 (define-constant err-min-amount-not-met (err u114))
+(define-constant err-milestone-not-found (err u115))
+(define-constant err-invalid-milestone (err u116))
+(define-constant err-milestone-already-completed (err u117))
+(define-constant err-milestone-not-ready (err u118))
+(define-constant err-insufficient-milestone-funds (err u119))
 
 (define-data-var last-token-id uint u0)
 (define-data-var total-scholarships uint u0)
@@ -21,6 +26,7 @@
 (define-data-var used-scholarships uint u0)
 (define-data-var expired-scholarships uint u0)
 (define-data-var last-pool-id uint u0)
+(define-data-var last-milestone-id uint u0)
 
 (define-map scholarship-details
     uint
@@ -34,6 +40,8 @@
         issuer: principal,
         is-used: bool,
         scholarship-id: (string-ascii 50),
+        has-milestones: bool,
+        milestone-schedule: uint,
     }
 )
 
@@ -89,6 +97,42 @@
 (define-map pool-contributors
     uint
     (list 100 principal)
+)
+
+(define-map milestone-schedules
+    uint
+    {
+        scholarship-id: uint,
+        total-milestones: uint,
+        completed-milestones: uint,
+        total-released: uint,
+    }
+)
+
+(define-map milestone-details
+    {
+        schedule-id: uint,
+        milestone-index: uint,
+    }
+    {
+        title: (string-ascii 100),
+        description: (string-ascii 200),
+        release-percentage: uint,
+        amount-to-release: uint,
+        is-completed: bool,
+        completed-at: uint,
+        verified-by: (optional principal),
+        evidence-hash: (optional (string-ascii 64)),
+    }
+)
+
+(define-map scholarship-milestone-funds
+    uint
+    {
+        total-reserved: uint,
+        total-released: uint,
+        remaining-balance: uint,
+    }
 )
 
 (define-read-only (get-last-token-id)
@@ -161,6 +205,43 @@
 
 (define-read-only (get-last-pool-id)
     (var-get last-pool-id)
+)
+
+(define-read-only (get-last-milestone-id)
+    (var-get last-milestone-id)
+)
+
+(define-read-only (get-milestone-schedule (schedule-id uint))
+    (map-get? milestone-schedules schedule-id)
+)
+
+(define-read-only (get-milestone-details
+        (schedule-id uint)
+        (milestone-index uint)
+    )
+    (map-get? milestone-details {
+        schedule-id: schedule-id,
+        milestone-index: milestone-index,
+    })
+)
+
+(define-read-only (get-scholarship-milestone-funds (scholarship-id uint))
+    (map-get? scholarship-milestone-funds scholarship-id)
+)
+
+(define-read-only (calculate-milestone-progress (schedule-id uint))
+    (match (map-get? milestone-schedules schedule-id)
+        schedule-info (let (
+                (total (get total-milestones schedule-info))
+                (completed (get completed-milestones schedule-info))
+            )
+            (if (> total u0)
+                (/ (* completed u100) total)
+                u0
+            )
+        )
+        u0
+    )
 )
 
 (define-read-only (is-scholarship-valid (token-id uint))
@@ -334,6 +415,190 @@
     )
 )
 
+(define-public (create-milestone-schedule
+        (scholarship-id uint)
+        (milestone-count uint)
+    )
+    (let (
+            (schedule-id (+ (var-get last-milestone-id) u1))
+            (scholarship-info (unwrap! (map-get? scholarship-details scholarship-id) err-not-found))
+            (issuer (get issuer scholarship-info))
+            (scholarship-amount (get amount scholarship-info))
+        )
+        (asserts! (is-eq tx-sender issuer) err-unauthorized)
+        (asserts! (not (get has-milestones scholarship-info)) err-already-issued)
+        (asserts! (> milestone-count u0) err-invalid-milestone)
+        (asserts! (<= milestone-count u10) err-invalid-milestone)
+
+        (map-set milestone-schedules schedule-id {
+            scholarship-id: scholarship-id,
+            total-milestones: milestone-count,
+            completed-milestones: u0,
+            total-released: u0,
+        })
+
+        (map-set scholarship-milestone-funds scholarship-id {
+            total-reserved: scholarship-amount,
+            total-released: u0,
+            remaining-balance: scholarship-amount,
+        })
+
+        (map-set scholarship-details scholarship-id
+            (merge scholarship-info {
+                has-milestones: true,
+                milestone-schedule: schedule-id,
+            })
+        )
+
+        (var-set last-milestone-id schedule-id)
+        (ok schedule-id)
+    )
+)
+
+(define-public (add-milestone
+        (schedule-id uint)
+        (milestone-index uint)
+        (title (string-ascii 100))
+        (description (string-ascii 200))
+        (release-percentage uint)
+    )
+    (let (
+            (schedule-info (unwrap! (map-get? milestone-schedules schedule-id)
+                err-milestone-not-found
+            ))
+            (scholarship-id (get scholarship-id schedule-info))
+            (scholarship-info (unwrap! (map-get? scholarship-details scholarship-id) err-not-found))
+            (issuer (get issuer scholarship-info))
+            (scholarship-amount (get amount scholarship-info))
+            (amount-to-release (/ (* scholarship-amount release-percentage) u100))
+        )
+        (asserts! (is-eq tx-sender issuer) err-unauthorized)
+        (asserts! (< milestone-index (get total-milestones schedule-info))
+            err-invalid-milestone
+        )
+        (asserts! (> release-percentage u0) err-invalid-milestone)
+        (asserts! (<= release-percentage u100) err-invalid-milestone)
+
+        (map-set milestone-details {
+            schedule-id: schedule-id,
+            milestone-index: milestone-index,
+        } {
+            title: title,
+            description: description,
+            release-percentage: release-percentage,
+            amount-to-release: amount-to-release,
+            is-completed: false,
+            completed-at: u0,
+            verified-by: none,
+            evidence-hash: none,
+        })
+
+        (ok true)
+    )
+)
+
+(define-public (submit-milestone-completion
+        (schedule-id uint)
+        (milestone-index uint)
+        (evidence-hash (string-ascii 64))
+    )
+    (let (
+            (schedule-info (unwrap! (map-get? milestone-schedules schedule-id)
+                err-milestone-not-found
+            ))
+            (scholarship-id (get scholarship-id schedule-info))
+            (scholarship-info (unwrap! (map-get? scholarship-details scholarship-id) err-not-found))
+            (recipient (get recipient scholarship-info))
+            (milestone-key {
+                schedule-id: schedule-id,
+                milestone-index: milestone-index,
+            })
+            (milestone-info (unwrap! (map-get? milestone-details milestone-key)
+                err-milestone-not-found
+            ))
+        )
+        (asserts! (is-eq tx-sender recipient) err-not-token-owner)
+        (asserts! (not (get is-completed milestone-info))
+            err-milestone-already-completed
+        )
+        (asserts! (< milestone-index (get total-milestones schedule-info))
+            err-invalid-milestone
+        )
+
+        (map-set milestone-details milestone-key
+            (merge milestone-info {
+                completed-at: burn-block-height,
+                evidence-hash: (some evidence-hash),
+            })
+        )
+
+        (ok true)
+    )
+)
+
+(define-public (verify-and-release-milestone
+        (schedule-id uint)
+        (milestone-index uint)
+    )
+    (let (
+            (schedule-info (unwrap! (map-get? milestone-schedules schedule-id)
+                err-milestone-not-found
+            ))
+            (scholarship-id (get scholarship-id schedule-info))
+            (scholarship-info (unwrap! (map-get? scholarship-details scholarship-id) err-not-found))
+            (issuer (get issuer scholarship-info))
+            (recipient (get recipient scholarship-info))
+            (milestone-key {
+                schedule-id: schedule-id,
+                milestone-index: milestone-index,
+            })
+            (milestone-info (unwrap! (map-get? milestone-details milestone-key)
+                err-milestone-not-found
+            ))
+            (funds-info (unwrap! (map-get? scholarship-milestone-funds scholarship-id)
+                err-not-found
+            ))
+            (release-amount (get amount-to-release milestone-info))
+            (current-completed (get completed-milestones schedule-info))
+        )
+        (asserts! (is-eq tx-sender issuer) err-unauthorized)
+        (asserts! (not (get is-completed milestone-info))
+            err-milestone-already-completed
+        )
+        (asserts! (is-some (get evidence-hash milestone-info))
+            err-milestone-not-ready
+        )
+        (asserts! (>= (get remaining-balance funds-info) release-amount)
+            err-insufficient-milestone-funds
+        )
+
+        (try! (as-contract (stx-transfer? release-amount tx-sender recipient)))
+
+        (map-set milestone-details milestone-key
+            (merge milestone-info {
+                is-completed: true,
+                verified-by: (some tx-sender),
+            })
+        )
+
+        (map-set milestone-schedules schedule-id
+            (merge schedule-info {
+                completed-milestones: (+ current-completed u1),
+                total-released: (+ (get total-released schedule-info) release-amount),
+            })
+        )
+
+        (map-set scholarship-milestone-funds scholarship-id
+            (merge funds-info {
+                total-released: (+ (get total-released funds-info) release-amount),
+                remaining-balance: (- (get remaining-balance funds-info) release-amount),
+            })
+        )
+
+        (ok release-amount)
+    )
+)
+
 (define-public (close-pool (pool-id uint))
     (let (
             (pool-info (unwrap! (map-get? scholarship-pools pool-id) err-pool-not-found))
@@ -377,6 +642,8 @@
             issuer: tx-sender,
             is-used: false,
             scholarship-id: scholarship-id,
+            has-milestones: false,
+            milestone-schedule: u0,
         })
 
         (map-set institution-scholarships institution
