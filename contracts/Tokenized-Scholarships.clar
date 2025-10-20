@@ -20,6 +20,13 @@
 (define-constant err-milestone-not-ready (err u118))
 (define-constant err-insufficient-milestone-funds (err u119))
 
+;; Rating and Review System Error Constants
+(define-constant err-not-recipient (err u301))
+(define-constant err-scholarship-not-used (err u302))
+(define-constant err-already-reviewed (err u303))
+(define-constant err-invalid-rating (err u304))
+(define-constant err-review-not-found (err u305))
+
 (define-data-var last-token-id uint u0)
 (define-data-var total-scholarships uint u0)
 (define-data-var active-scholarships uint u0)
@@ -133,6 +140,43 @@
         total-released: uint,
         remaining-balance: uint,
     }
+)
+
+;; Rating and Review System Data Maps
+(define-map scholarship-reviews
+    {
+        scholarship-id: uint,
+        reviewer: principal,
+    }
+    {
+        rating: uint,
+        review-text: (string-utf8 500),
+        is-anonymous: bool,
+        submitted-at: uint,
+        last-updated: uint,
+    }
+)
+
+(define-map rating-aggregates
+    uint
+    {
+        total-reviews: uint,
+        total-rating-points: uint,
+        average-rating: uint,
+        five-star-count: uint,
+        four-star-count: uint,
+        three-star-count: uint,
+        two-star-count: uint,
+        one-star-count: uint,
+    }
+)
+
+(define-map reviewer-registry
+    {
+        scholarship-id: uint,
+        reviewer: principal,
+    }
+    bool
 )
 
 (define-read-only (get-last-token-id)
@@ -766,6 +810,104 @@
     )
 )
 
+;; Rating and Review System Public Functions
+(define-public (submit-review
+        (scholarship-id uint)
+        (rating uint)
+        (review-text (string-utf8 500))
+        (is-anonymous bool)
+    )
+    (let (
+            (scholarship-info (unwrap! (map-get? scholarship-details scholarship-id) err-not-found))
+            (recipient (get recipient scholarship-info))
+            (is-used (get is-used scholarship-info))
+            (current-block burn-block-height)
+            (review-key {
+                scholarship-id: scholarship-id,
+                reviewer: tx-sender,
+            })
+            (current-aggregates (get-rating-summary scholarship-id))
+        )
+        ;; Validate reviewer is the scholarship recipient
+        (asserts! (is-eq tx-sender recipient) err-not-recipient)
+        ;; Validate scholarship has been used
+        (asserts! is-used err-scholarship-not-used)
+        ;; Validate rating is between 1-5
+        (asserts! (and (>= rating u1) (<= rating u5)) err-invalid-rating)
+        ;; Validate reviewer hasn't already reviewed this scholarship
+        (asserts! (not (has-reviewed scholarship-id tx-sender)) err-already-reviewed)
+
+        ;; Store the review
+        (map-set scholarship-reviews review-key {
+            rating: rating,
+            review-text: review-text,
+            is-anonymous: is-anonymous,
+            submitted-at: current-block,
+            last-updated: current-block,
+        })
+
+        ;; Mark as reviewed in registry
+        (map-set reviewer-registry review-key true)
+
+        ;; Update aggregated ratings
+        (update-rating-aggregates scholarship-id rating current-aggregates)
+
+        (ok true)
+    )
+)
+
+(define-private (update-rating-aggregates
+        (scholarship-id uint)
+        (new-rating uint)
+        (current-aggregates (tuple 
+            (total-reviews uint) 
+            (total-rating-points uint) 
+            (average-rating uint)
+            (five-star-count uint)
+            (four-star-count uint)
+            (three-star-count uint)
+            (two-star-count uint)
+            (one-star-count uint)
+        ))
+    )
+    (let (
+            (new-total-reviews (+ (get total-reviews current-aggregates) u1))
+            (new-total-points (+ (get total-rating-points current-aggregates) new-rating))
+            (new-average (/ (* new-total-points u100) new-total-reviews)) ;; Multiply by 100 for precision
+            (new-five-stars (if (is-eq new-rating u5) 
+                (+ (get five-star-count current-aggregates) u1)
+                (get five-star-count current-aggregates)
+            ))
+            (new-four-stars (if (is-eq new-rating u4) 
+                (+ (get four-star-count current-aggregates) u1)
+                (get four-star-count current-aggregates)
+            ))
+            (new-three-stars (if (is-eq new-rating u3) 
+                (+ (get three-star-count current-aggregates) u1)
+                (get three-star-count current-aggregates)
+            ))
+            (new-two-stars (if (is-eq new-rating u2) 
+                (+ (get two-star-count current-aggregates) u1)
+                (get two-star-count current-aggregates)
+            ))
+            (new-one-stars (if (is-eq new-rating u1) 
+                (+ (get one-star-count current-aggregates) u1)
+                (get one-star-count current-aggregates)
+            ))
+        )
+        (map-set rating-aggregates scholarship-id {
+            total-reviews: new-total-reviews,
+            total-rating-points: new-total-points,
+            average-rating: new-average,
+            five-star-count: new-five-stars,
+            four-star-count: new-four-stars,
+            three-star-count: new-three-stars,
+            two-star-count: new-two-stars,
+            one-star-count: new-one-stars,
+        })
+    )
+)
+
 (define-read-only (get-scholarship-stats)
     {
         total: (var-get total-scholarships),
@@ -816,6 +958,56 @@
         scholarship-info (get field-of-study scholarship-info)
         ""
     )
+)
+
+;; Rating and Review System Read-Only Functions
+(define-read-only (get-review (scholarship-id uint) (reviewer principal))
+    (map-get? scholarship-reviews {
+        scholarship-id: scholarship-id,
+        reviewer: reviewer,
+    })
+)
+
+(define-read-only (get-rating-summary (scholarship-id uint))
+    (default-to {
+        total-reviews: u0,
+        total-rating-points: u0,
+        average-rating: u0,
+        five-star-count: u0,
+        four-star-count: u0,
+        three-star-count: u0,
+        two-star-count: u0,
+        one-star-count: u0,
+    } (map-get? rating-aggregates scholarship-id))
+)
+
+(define-read-only (has-reviewed (scholarship-id uint) (reviewer principal))
+    (default-to false (map-get? reviewer-registry {
+        scholarship-id: scholarship-id,
+        reviewer: reviewer,
+    }))
+)
+
+(define-read-only (is-eligible-to-review (scholarship-id uint) (reviewer principal))
+    (let (
+            (scholarship-info (map-get? scholarship-details scholarship-id))
+            (usage-info (map-get? scholarship-usage scholarship-id))
+        )
+        (match scholarship-info
+            details (let (
+                    (is-recipient (is-eq (get recipient details) reviewer))
+                    (is-used (get is-used details))
+                    (already-reviewed (has-reviewed scholarship-id reviewer))
+                )
+                (and is-recipient is-used (not already-reviewed))
+            )
+            false
+        )
+    )
+)
+
+(define-read-only (get-scholarship-average-rating (scholarship-id uint))
+    (get average-rating (get-rating-summary scholarship-id))
 )
 
 (begin
