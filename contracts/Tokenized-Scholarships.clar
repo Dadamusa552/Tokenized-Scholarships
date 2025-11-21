@@ -835,7 +835,9 @@
         ;; Validate rating is between 1-5
         (asserts! (and (>= rating u1) (<= rating u5)) err-invalid-rating)
         ;; Validate reviewer hasn't already reviewed this scholarship
-        (asserts! (not (has-reviewed scholarship-id tx-sender)) err-already-reviewed)
+        (asserts! (not (has-reviewed scholarship-id tx-sender))
+            err-already-reviewed
+        )
 
         ;; Store the review
         (map-set scholarship-reviews review-key {
@@ -859,38 +861,38 @@
 (define-private (update-rating-aggregates
         (scholarship-id uint)
         (new-rating uint)
-        (current-aggregates (tuple 
-            (total-reviews uint) 
-            (total-rating-points uint) 
-            (average-rating uint)
-            (five-star-count uint)
-            (four-star-count uint)
-            (three-star-count uint)
-            (two-star-count uint)
-            (one-star-count uint)
-        ))
+        (current-aggregates {
+            total-reviews: uint,
+            total-rating-points: uint,
+            average-rating: uint,
+            five-star-count: uint,
+            four-star-count: uint,
+            three-star-count: uint,
+            two-star-count: uint,
+            one-star-count: uint,
+        })
     )
     (let (
             (new-total-reviews (+ (get total-reviews current-aggregates) u1))
             (new-total-points (+ (get total-rating-points current-aggregates) new-rating))
             (new-average (/ (* new-total-points u100) new-total-reviews)) ;; Multiply by 100 for precision
-            (new-five-stars (if (is-eq new-rating u5) 
+            (new-five-stars (if (is-eq new-rating u5)
                 (+ (get five-star-count current-aggregates) u1)
                 (get five-star-count current-aggregates)
             ))
-            (new-four-stars (if (is-eq new-rating u4) 
+            (new-four-stars (if (is-eq new-rating u4)
                 (+ (get four-star-count current-aggregates) u1)
                 (get four-star-count current-aggregates)
             ))
-            (new-three-stars (if (is-eq new-rating u3) 
+            (new-three-stars (if (is-eq new-rating u3)
                 (+ (get three-star-count current-aggregates) u1)
                 (get three-star-count current-aggregates)
             ))
-            (new-two-stars (if (is-eq new-rating u2) 
+            (new-two-stars (if (is-eq new-rating u2)
                 (+ (get two-star-count current-aggregates) u1)
                 (get two-star-count current-aggregates)
             ))
-            (new-one-stars (if (is-eq new-rating u1) 
+            (new-one-stars (if (is-eq new-rating u1)
                 (+ (get one-star-count current-aggregates) u1)
                 (get one-star-count current-aggregates)
             ))
@@ -961,7 +963,10 @@
 )
 
 ;; Rating and Review System Read-Only Functions
-(define-read-only (get-review (scholarship-id uint) (reviewer principal))
+(define-read-only (get-review
+        (scholarship-id uint)
+        (reviewer principal)
+    )
     (map-get? scholarship-reviews {
         scholarship-id: scholarship-id,
         reviewer: reviewer,
@@ -978,17 +983,27 @@
         three-star-count: u0,
         two-star-count: u0,
         one-star-count: u0,
-    } (map-get? rating-aggregates scholarship-id))
+    }
+        (map-get? rating-aggregates scholarship-id)
+    )
 )
 
-(define-read-only (has-reviewed (scholarship-id uint) (reviewer principal))
-    (default-to false (map-get? reviewer-registry {
-        scholarship-id: scholarship-id,
-        reviewer: reviewer,
-    }))
+(define-read-only (has-reviewed
+        (scholarship-id uint)
+        (reviewer principal)
+    )
+    (default-to false
+        (map-get? reviewer-registry {
+            scholarship-id: scholarship-id,
+            reviewer: reviewer,
+        })
+    )
 )
 
-(define-read-only (is-eligible-to-review (scholarship-id uint) (reviewer principal))
+(define-read-only (is-eligible-to-review
+        (scholarship-id uint)
+        (reviewer principal)
+    )
     (let (
             (scholarship-info (map-get? scholarship-details scholarship-id))
             (usage-info (map-get? scholarship-usage scholarship-id))
@@ -999,7 +1014,11 @@
                     (is-used (get is-used details))
                     (already-reviewed (has-reviewed scholarship-id reviewer))
                 )
-                (and is-recipient is-used (not already-reviewed))
+                (and
+                    is-recipient
+                    is-used
+                    (not already-reviewed)
+                )
             )
             false
         )
@@ -1008,6 +1027,32 @@
 
 (define-read-only (get-scholarship-average-rating (scholarship-id uint))
     (get average-rating (get-rating-summary scholarship-id))
+)
+
+(define-read-only (get-scholarship-overview (token-id uint))
+    (match (map-get? scholarship-details token-id)
+        scholarship-info (let (
+                (usage-info (map-get? scholarship-usage token-id))
+                (status (get-scholarship-status token-id))
+                (schedule-id (get milestone-schedule scholarship-info))
+                (has-milestones (get has-milestones scholarship-info))
+                (schedule-info (if (and has-milestones (> schedule-id u0))
+                    (map-get? milestone-schedules schedule-id)
+                    none
+                ))
+                (rating-summary (get-rating-summary token-id))
+            )
+            (ok {
+                token-id: token-id,
+                scholarship: scholarship-info,
+                usage: usage-info,
+                status: status,
+                milestone-schedule: schedule-info,
+                rating-summary: rating-summary,
+            })
+        )
+        (err u104)
+    )
 )
 
 (begin
